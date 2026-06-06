@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.git/
+output/
+uploads/
+data/
+backup/
+templates/source.hwp
+templates/source.hwpx
+*.log
