@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-APP_VERSION = "2026.06.06-r11-openable-hwpx"
+APP_VERSION = "2026.06.06-r12-weekly-source-form"
 ROOT = Path(__file__).resolve().parent
 IS_VERCEL = bool(os.environ.get("VERCEL"))
 RUNTIME_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / "weekly-work-plan-collector" if IS_VERCEL else ROOT
@@ -316,32 +316,47 @@ li {{ margin:3px 0; line-height:1.55; font-size:14px; }}
 </main></body></html>"""
 
 
+def normalize_weekly_detail_line(detail: str) -> str:
+    """Match the visible source HWP style: indented ○ detail rows."""
+    detail = (detail or "").strip()
+    if not detail:
+        return ""
+    if detail.startswith("○"):
+        return "  " + detail
+    if detail.startswith(("-", "·", "*")):
+        return "  ○ " + detail.lstrip("-·* ")
+    if detail.startswith("※") or detail.startswith("*"):
+        return "      " + detail
+    return "  ○ " + detail
+
+
 def build_hwpx_lines(data: dict[str, Any]) -> list[str]:
-    lines = [
-        "주간업무계획 회의자료",
-        f"회의일자: {data.get('meeting_date', '')}",
-        f"대상기간: {data.get('week_title', '')}",
-        f"취합시각: {data.get('generated_at', '')}",
-        "",
-    ]
+    """Build lines in the attached weekly-meeting HWP form style.
+
+    The source form does not use separate department headings. Each work item starts
+    with the HWP bullet glyph and ends with the responsible department, followed by
+    indented ○ detail rows. Keeping this line order makes the generated HWPX read like
+    the provided `주간업무계획 회의자료(2026.06.08.~06.12.).hwp` form instead of a generic
+    report summary.
+    """
+    meeting_date = (data.get("meeting_date") or "").strip()
+    lines = [meeting_date or "2026.  6.  8.(월)", "", ""]
     has_item = False
     for dept in DEPARTMENT_ORDER:
         items = data.get("departments", {}).get(dept, [])
-        if not items:
-            continue
-        lines.append(f"□ {dept}")
         for item in items:
             title = item.get("title", "").strip()
-            details = [x.strip() for x in item.get("details", []) if x.strip()]
-            if title:
-                has_item = True
-                lines.append(f"  ○ {title}")
-            for detail in details:
-                has_item = True
-                lines.append(f"    - {detail.lstrip('○-· ')}")
-        lines.append("")
+            details = [normalize_weekly_detail_line(x) for x in item.get("details", []) if x.strip()]
+            if not title and not details:
+                continue
+            has_item = True
+            # 원본 양식은 제목 바로 뒤에 부서명이 붙는 구조임: 󰏚 제목행정팀
+            lines.append(f"󰏚 {title}{dept}" if title else f"󰏚 {dept}")
+            lines.extend(details)
+        if items:
+            lines.append("")
     if not has_item:
-        lines.append("입력된 자료가 없습니다.")
+        lines.append("󰏚 입력된 자료가 없습니다.관리부서")
     return lines
 
 
@@ -413,7 +428,7 @@ def build_hwpx_section_from_template(template_xml: str, lines: list[str]) -> str
         f'<hp:run charPrIDRef="37">{secpr}</hp:run></hp:p>'
     ]
     for idx, line in enumerate(lines, 1):
-        kind = "title" if idx == 1 else ("heading" if line.startswith("□ ") else "body")
+        kind = "title" if idx == 1 else ("heading" if line.startswith(("□ ", "󰏚 ")) else "body")
         body.append(para(line, idx, kind))
     return root_open + "".join(body) + "</hs:sec>"
 
@@ -443,7 +458,13 @@ def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
                 text = re.sub(r"<opf:title>.*?</opf:title>", f"<opf:title>{title_text}</opf:title>", text, flags=re.S)
                 data_bytes = text.encode("utf-8")
             zout.writestr(item, data_bytes)
-    validate_hwpx(out_path, must_contain=["주간업무계획 회의자료", data.get("week_title", "")])
+    required_texts = [data.get("meeting_date", "")]
+    for dept in DEPARTMENT_ORDER:
+        items = data.get("departments", {}).get(dept, [])
+        if items and items[0].get("title"):
+            required_texts.append(items[0].get("title", ""))
+            break
+    validate_hwpx(out_path, must_contain=required_texts)
 
 
 @app.get("/health")
