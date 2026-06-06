@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-APP_VERSION = "2026.06.06-r12-weekly-source-form"
+APP_VERSION = "2026.06.06-r13-original-hwp-form-local"
 ROOT = Path(__file__).resolve().parent
 IS_VERCEL = bool(os.environ.get("VERCEL"))
 RUNTIME_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / "weekly-work-plan-collector" if IS_VERCEL else ROOT
@@ -28,6 +28,7 @@ UPLOADS = RUNTIME_ROOT / "uploads"
 SESSIONS = DATA / "sessions"
 TEMPLATES = ROOT / "templates"
 SOURCE_HWP = TEMPLATES / "source.hwp"
+SOURCE_HWPX = TEMPLATES / "source.hwpx"
 BASE_HWPX = TEMPLATES / "base.hwpx"
 SEED_JSON = DATA / "seed.json"
 OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -331,14 +332,7 @@ def normalize_weekly_detail_line(detail: str) -> str:
 
 
 def build_hwpx_lines(data: dict[str, Any]) -> list[str]:
-    """Build lines in the attached weekly-meeting HWP form style.
-
-    The source form does not use separate department headings. Each work item starts
-    with the HWP bullet glyph and ends with the responsible department, followed by
-    indented ○ detail rows. Keeping this line order makes the generated HWPX read like
-    the provided `주간업무계획 회의자료(2026.06.08.~06.12.).hwp` form instead of a generic
-    report summary.
-    """
+    """Fallback flat lines when the original converted HWPX template is unavailable."""
     meeting_date = (data.get("meeting_date") or "").strip()
     lines = [meeting_date or "2026.  6.  8.(월)", "", ""]
     has_item = False
@@ -350,7 +344,6 @@ def build_hwpx_lines(data: dict[str, Any]) -> list[str]:
             if not title and not details:
                 continue
             has_item = True
-            # 원본 양식은 제목 바로 뒤에 부서명이 붙는 구조임: 󰏚 제목행정팀
             lines.append(f"󰏚 {title}{dept}" if title else f"󰏚 {dept}")
             lines.extend(details)
         if items:
@@ -358,6 +351,144 @@ def build_hwpx_lines(data: dict[str, Any]) -> list[str]:
     if not has_item:
         lines.append("󰏚 입력된 자료가 없습니다.관리부서")
     return lines
+
+
+SOURCE_FORM_GROUPS = [
+    {"header_index": 19, "header": "소방행정과", "range": range(20, 48), "departments": ["행정팀", "장비회계팀", "홍보교육팀"]},
+    {"header_index": 48, "header": "재난관리과", "range": range(49, 76), "departments": ["대응총괄팀", "구조팀", "구급팀"]},
+    {"header_index": 76, "header": "예  방  과", "range": range(77, 106), "departments": ["예방팀", "검사지도팀", "위험물안전팀"]},
+    {"header_index": 106, "header": "현장대응단", "range": range(107, 132), "departments": ["현장대응단"]},
+]
+
+
+def compact_week_title(week_title: str) -> str:
+    """Convert '2026. 6. 8.(월) ~ 6. 12.(금)' to the source cover style."""
+    nums = re.findall(r"\d+", week_title or "")
+    if len(nums) >= 5:
+        return f"{int(nums[0])}. {int(nums[1])}. {int(nums[2])}.~ {int(nums[3])}. {int(nums[4])}."
+    return (week_title or "2026. 6. 8.~ 6. 12.").replace("(월)", "").replace("(금)", "").replace(" ~ ", "~ ")
+
+
+def build_source_form_lines_by_group(data: dict[str, Any]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {g["header"]: [] for g in SOURCE_FORM_GROUPS}
+    dept_to_header = {dept: g["header"] for g in SOURCE_FORM_GROUPS for dept in g["departments"]}
+    for dept in DEPARTMENT_ORDER:
+        header = dept_to_header.get(dept)
+        if not header:
+            continue
+        for item in data.get("departments", {}).get(dept, []):
+            title = item.get("title", "").strip()
+            details = [normalize_weekly_detail_line(x) for x in item.get("details", []) if x.strip()]
+            if not title and not details:
+                continue
+            grouped[header].append(f"󰏚 {title}{dept}" if title else f"󰏚 {dept}")
+            grouped[header].extend(details)
+    if not any(grouped.values()):
+        grouped["소방행정과"].append("󰏚 입력된 자료가 없습니다.행정팀")
+    return grouped
+
+
+def replace_first_text_in_para(para_xml: str, text: str) -> str:
+    """Preserve original paragraph/table/picture/run styling and replace only visible text."""
+    escaped = escape(text or "", quote=False)
+    seen = False
+    def repl(match: re.Match[str]) -> str:
+        nonlocal seen
+        if not seen:
+            seen = True
+            return f"{match.group(1)}{escaped}{match.group(3)}"
+        return f"{match.group(1)}{match.group(3)}"
+    replaced = re.sub(r"(<hp:t\b[^>]*>)(.*?)(</hp:t>)", repl, para_xml, flags=re.S)
+    if seen:
+        return replaced
+    # Some spacing paragraphs have no text node. Inject a run before paragraph close as a fallback.
+    return replaced.replace("</hp:p>", f'<hp:run charPrIDRef="0"><hp:t>{escaped}</hp:t></hp:run></hp:p>', 1)
+
+
+def split_source_paragraphs(section_xml: str) -> tuple[str, list[str], str]:
+    root_match = re.match(r"(.*?<hs:sec\b[^>]*>)", section_xml, re.S)
+    if not root_match:
+        raise ValueError("원본 HWPX section root를 찾을 수 없습니다.")
+    prefix = root_match.group(1)
+    body_start = len(prefix)
+    sec_close = section_xml.rfind("</hs:sec>")
+    if sec_close < 0:
+        raise ValueError("원본 HWPX section 종료 태그를 찾을 수 없습니다.")
+    body = section_xml[body_start:sec_close]
+    suffix = section_xml[sec_close:]
+
+    # `hp:p` elements can contain tables, and table cells contain nested `hp:p`.
+    # A simple non-greedy regex corrupts the XML by stopping at an inner cell
+    # paragraph. Scan tags and split only depth-0 top-level paragraphs.
+    paras: list[str] = []
+    paragraph_tag = re.compile(r"<hp:p(?=[\s>])|</hp:p>")
+    i = 0
+    while True:
+        m_start = paragraph_tag.search(body, i)
+        if not m_start:
+            tail = body[i:].strip()
+            if tail:
+                raise ValueError("원본 HWPX 문단 외 XML 조각이 남아 있습니다.")
+            break
+        if m_start.group(0) == "</hp:p>":
+            raise ValueError("원본 HWPX 문단 시작 전 종료 태그가 있습니다.")
+        start = m_start.start()
+        if body[i:start].strip():
+            raise ValueError("원본 HWPX 문단 사이 XML 조각을 처리할 수 없습니다.")
+        depth = 0
+        pos = start
+        while True:
+            m = paragraph_tag.search(body, pos)
+            if not m:
+                raise ValueError("원본 HWPX 문단 종료 태그를 찾을 수 없습니다.")
+            if m.group(0).startswith("<hp:p"):
+                depth += 1
+            else:
+                depth -= 1
+                if depth == 0:
+                    end = m.end()
+                    paras.append(body[start:end])
+                    i = end
+                    break
+            pos = m.end()
+    if len(paras) < 140:
+        raise ValueError(f"원본 HWPX 문단 수가 예상보다 적습니다: {len(paras)}")
+    return prefix, paras, suffix
+
+
+def build_source_form_section(template_xml: str, data: dict[str, Any]) -> str:
+    """Clone the converted original HWPX section and replace only source-form text slots.
+
+    This is the local, layout-preserving path for Ryan's source file
+    `주간업무계획 회의자료(2026.06.08.~06.12.).hwp`: cover/title/table/picture/header
+    structures remain from the converted HWPX, and department work paragraphs are
+    written into the same paragraph positions used by the original form.
+    """
+    prefix, paras, suffix = split_source_paragraphs(template_xml)
+    # Meeting date field from the converted original HWP form. The cover table already
+    # contains the same target week in the attached source form, so do not rewrite that
+    # table wholesale; doing so would disturb the title text in the same table object.
+    paras[9] = replace_first_text_in_para(paras[9], data.get("meeting_date", "") or "2026.  6.  8.(월)")
+
+    grouped = build_source_form_lines_by_group(data)
+    for group in SOURCE_FORM_GROUPS:
+        paras[group["header_index"]] = replace_first_text_in_para(paras[group["header_index"]], group["header"])
+        slots = list(group["range"])
+        lines = grouped.get(group["header"], [])
+        for pos, line in zip(slots, lines):
+            paras[pos] = replace_first_text_in_para(paras[pos], line)
+        for pos in slots[len(lines):]:
+            paras[pos] = replace_first_text_in_para(paras[pos], "")
+        # If one group exceeds the original slot count, insert extra body-style paragraphs
+        # right before the next preserved header/bottom section. This keeps the source form
+        # usable for unusually large submissions while preserving all existing structures.
+        overflow = lines[len(slots):]
+        if overflow:
+            clone = paras[slots[-1]]
+            insert_at = slots[-1] + 1
+            for offset, line in enumerate(overflow):
+                paras.insert(insert_at + offset, replace_first_text_in_para(clone, line))
+    return prefix + "".join(paras) + suffix
 
 
 def extract_hwpx_text(hwpx_path: Path) -> str:
@@ -395,12 +526,7 @@ def validate_hwpx(path: Path, must_contain: list[str] | None = None) -> None:
 
 
 def build_hwpx_section_from_template(template_xml: str, lines: list[str]) -> str:
-    """Use a real HWPX section skeleton and replace only the body paragraphs.
-
-    The previous handcrafted ZIP/XML package passed basic XML checks but some Hancom
-    viewers rejected it. This keeps the namespace/root/section-property structure from
-    a known-openable HWPX and writes clean paragraphs into that valid container.
-    """
+    """Fallback section builder for the sanitized base skeleton."""
     root_match = re.match(r'(<\?xml[^>]+\?>\s*<hs:sec\b[^>]*>)', template_xml, re.S)
     if not root_match:
         raise ValueError("HWPX section root를 찾을 수 없습니다.")
@@ -434,13 +560,15 @@ def build_hwpx_section_from_template(template_xml: str, lines: list[str]) -> str
 
 
 def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
-    """Create an openable HWPX by cloning a sanitized real HWPX skeleton."""
-    if not BASE_HWPX.exists():
-        raise FileNotFoundError("templates/base.hwpx 템플릿이 없습니다. HWPX 기본 골격 파일이 필요합니다.")
+    """Create HWPX output, preferring the converted original HWP form locally."""
+    template = SOURCE_HWPX if SOURCE_HWPX.exists() else BASE_HWPX
+    if not template.exists():
+        raise FileNotFoundError("templates/source.hwpx 또는 templates/base.hwpx 템플릿이 없습니다.")
+    use_source_form = template == SOURCE_HWPX
     lines = build_hwpx_lines(data)
     preview_text = "\r\n".join(f"<{line}>" if line else "" for line in lines)
     title_text = "주간업무계획 회의자료"
-    with zipfile.ZipFile(BASE_HWPX, "r") as zin, zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+    with zipfile.ZipFile(template, "r") as zin, zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data_bytes = zin.read(item.filename)
             if item.filename == "mimetype":
@@ -448,8 +576,11 @@ def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
                 continue
             if item.filename == "Contents/section0.xml":
                 xml = data_bytes.decode("utf-8", errors="replace")
-                data_bytes = build_hwpx_section_from_template(xml, lines).encode("utf-8")
-            elif item.filename.startswith("Contents/section") and item.filename.endswith(".xml"):
+                if use_source_form:
+                    data_bytes = build_source_form_section(xml, data).encode("utf-8")
+                else:
+                    data_bytes = build_hwpx_section_from_template(xml, lines).encode("utf-8")
+            elif (not use_source_form) and item.filename.startswith("Contents/section") and item.filename.endswith(".xml"):
                 continue
             elif item.filename == "Preview/PrvText.txt":
                 data_bytes = preview_text.encode("utf-8")
@@ -459,6 +590,8 @@ def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
                 data_bytes = text.encode("utf-8")
             zout.writestr(item, data_bytes)
     required_texts = [data.get("meeting_date", "")]
+    if use_source_form:
+        required_texts.extend(["주  간  업  무  계  획", "강 서 소 방 서", "■ 소방활동 현황", "■ 주요재난"])
     for dept in DEPARTMENT_ORDER:
         items = data.get("departments", {}).get(dept, [])
         if items and items[0].get("title"):
@@ -469,7 +602,7 @@ def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION, "source_hwp": SOURCE_HWP.exists()}
+    return {"ok": True, "version": APP_VERSION, "source_hwp": SOURCE_HWP.exists(), "source_hwpx": SOURCE_HWPX.exists()}
 
 
 @app.get("/api/sessions")
@@ -564,7 +697,7 @@ def api_reset(session_id: str = ""):
 def index():
     ensure_default_session()
     seed = load_seed()
-    source_note = "원본 HWP 보관 완료" if SOURCE_HWP.exists() else "원본 HWP 없음"
+    source_note = "원본 HWPX 변환본 적용 중" if SOURCE_HWPX.exists() else ("원본 HWP 보관 완료" if SOURCE_HWP.exists() else "원본 HWP 없음")
     html = (INDEX_HTML
         .replace("__SEED__", json.dumps(seed, ensure_ascii=False))
         .replace("__SESSIONS__", json.dumps(list_sessions(), ensure_ascii=False))
@@ -686,7 +819,7 @@ body{font-size:17px;line-height:1.42}.header-inner{grid-template-columns:1fr}.he
   <div class="toolbar"><div class="field"><label>대상기간</label><input id="week" value="2026. 6. 8.(월) ~ 6. 12.(금)"></div><div class="field"><label>회의일자</label><input id="meeting" value="2026. 6. 8.(월)"></div><div class="field"><label>취합 담당</label><input id="writer" placeholder="예: 기획담당"></div><div class="field"><label>상태</label><div class="status">__SOURCE_NOTE__<br>v__VERSION__</div></div></div>
   <div class="main"><nav class="side" id="deptNav"></nav><main class="content"><div class="section-title"><h2 id="deptTitle"></h2><button class="btn ghost" onclick="addItem()">+ 업무 추가</button></div><div class="hint">부서별 업무를 직접 입력하면 상단 현황판에 입력 여부와 취합비율이 즉시 반영됩니다.</div><div class="input-guide"><div><b>제목 입력</b>업무명을 한 줄로 명확하게 작성합니다.</div><div><b>세부내용 입력</b>줄바꿈으로 추진일정·협조사항을 구분합니다.</div><div><b>자동 반영</b>입력 즉시 제출 상태와 취합률에 반영됩니다.</div></div><div class="count"><div>현재 부서<b id="deptCount">0건</b></div><div>전체 업무<b id="totalCount">0건</b></div><div>입력 부서<b id="filledCount">0개</b></div></div><div id="items"></div></main></div>
   <div class="actions"><button class="btn ghost" onclick="loadSeed()">무작위 예시 새로 불러오기</button><button class="btn reset" onclick="resetAllData()">데이터 초기화</button><button class="btn primary" onclick="generate()">취합 결과물 생성</button><div id="result" class="status download" style="min-width:360px">생성 전입니다.</div></div>
-</section><p class="notice">※ 데이터 초기화는 현재 세션의 입력 내용, 업로드 현황, 저장된 업로드 파일을 모두 빈 상태로 비웁니다. 현재 웹 출력은 HWPX 취합본입니다. 원본과 완전히 동일한 편집 서식 출력은 원본 HWPX 변환 후 XML 위치 매핑을 적용해 운영 단계에서 확정합니다.</p></div>
+</section><p class="notice">※ 데이터 초기화는 현재 세션의 입력 내용, 업로드 현황, 저장된 업로드 파일을 모두 빈 상태로 비웁니다. 현재 로컬 출력은 첨부 원본 HWP를 변환한 HWPX 양식을 기반으로 표·그림·부서 구획을 보존하고 입력 텍스트만 반영합니다.</p></div>
 <script>
 const seed=__SEED__;
 let sessions=__SESSIONS__;
