@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-APP_VERSION = "2026.06.06-r10-item-layout-fix"
+APP_VERSION = "2026.06.06-r11-openable-hwpx"
 ROOT = Path(__file__).resolve().parent
 IS_VERCEL = bool(os.environ.get("VERCEL"))
 RUNTIME_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / "weekly-work-plan-collector" if IS_VERCEL else ROOT
@@ -28,6 +28,7 @@ UPLOADS = RUNTIME_ROOT / "uploads"
 SESSIONS = DATA / "sessions"
 TEMPLATES = ROOT / "templates"
 SOURCE_HWP = TEMPLATES / "source.hwp"
+BASE_HWPX = TEMPLATES / "base.hwpx"
 SEED_JSON = DATA / "seed.json"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 DATA.mkdir(parents=True, exist_ok=True)
@@ -315,71 +316,134 @@ li {{ margin:3px 0; line-height:1.55; font-size:14px; }}
 </main></body></html>"""
 
 
-def hwpx_paragraph(text: str, pid: int) -> str:
-    return f'<hp:p id="{pid}" paraPrIDRef="0" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>{escape(text or "")}</hp:t></hp:run></hp:p>'
-
-
-def build_hwpx_section(data: dict[str, Any]) -> str:
-    paras: list[str] = []
-    pid = 1
-    for line in [
+def build_hwpx_lines(data: dict[str, Any]) -> list[str]:
+    lines = [
         "주간업무계획 회의자료",
         f"회의일자: {data.get('meeting_date', '')}",
         f"대상기간: {data.get('week_title', '')}",
         f"취합시각: {data.get('generated_at', '')}",
         "",
-    ]:
-        paras.append(hwpx_paragraph(line, pid)); pid += 1
+    ]
+    has_item = False
     for dept in DEPARTMENT_ORDER:
         items = data.get("departments", {}).get(dept, [])
         if not items:
             continue
-        paras.append(hwpx_paragraph(f"□ {dept}", pid)); pid += 1
+        lines.append(f"□ {dept}")
         for item in items:
             title = item.get("title", "").strip()
             details = [x.strip() for x in item.get("details", []) if x.strip()]
             if title:
-                paras.append(hwpx_paragraph(f"  ○ {title}", pid)); pid += 1
+                has_item = True
+                lines.append(f"  ○ {title}")
             for detail in details:
-                paras.append(hwpx_paragraph(f"    - {detail.lstrip('○-· ')}", pid)); pid += 1
-        paras.append(hwpx_paragraph("", pid)); pid += 1
-    if len(paras) <= 5:
-        paras.append(hwpx_paragraph("입력된 자료가 없습니다.", pid))
-    return "".join(paras)
+                has_item = True
+                lines.append(f"    - {detail.lstrip('○-· ')}")
+        lines.append("")
+    if not has_item:
+        lines.append("입력된 자료가 없습니다.")
+    return lines
+
+
+def extract_hwpx_text(hwpx_path: Path) -> str:
+    texts: list[str] = []
+    with zipfile.ZipFile(hwpx_path) as zf:
+        for name in sorted(n for n in zf.namelist() if n.startswith("Contents/section") and n.endswith(".xml")):
+            raw = zf.read(name).decode("utf-8", errors="replace")
+            for value in re.findall(r"<hp:t[^>]*>(.*?)</hp:t>", raw, re.S):
+                clean = re.sub(r"<[^>]+>", "", value)
+                clean = clean.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                if clean.strip():
+                    texts.append(clean.strip())
+    return "\n".join(texts)
+
+
+def validate_hwpx(path: Path, must_contain: list[str] | None = None) -> None:
+    with zipfile.ZipFile(path) as zf:
+        bad = zf.testzip()
+        if bad:
+            raise ValueError(f"HWPX ZIP 손상: {bad}")
+        names = set(zf.namelist())
+        required = {"mimetype", "META-INF/container.xml", "Contents/content.hpf", "Contents/header.xml", "Contents/section0.xml"}
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError("HWPX 필수 구성 누락: " + ", ".join(missing))
+        import xml.etree.ElementTree as ET
+        for name in names:
+            if name.endswith((".xml", ".hpf", ".rdf")):
+                ET.fromstring(zf.read(name))
+    if must_contain:
+        text = extract_hwpx_text(path)
+        missing_text = [s for s in must_contain if s and s not in text]
+        if missing_text:
+            raise ValueError("생성 HWPX 필수 문구 누락: " + ", ".join(missing_text[:5]))
+
+
+def build_hwpx_section_from_template(template_xml: str, lines: list[str]) -> str:
+    """Use a real HWPX section skeleton and replace only the body paragraphs.
+
+    The previous handcrafted ZIP/XML package passed basic XML checks but some Hancom
+    viewers rejected it. This keeps the namespace/root/section-property structure from
+    a known-openable HWPX and writes clean paragraphs into that valid container.
+    """
+    root_match = re.match(r'(<\?xml[^>]+\?>\s*<hs:sec\b[^>]*>)', template_xml, re.S)
+    if not root_match:
+        raise ValueError("HWPX section root를 찾을 수 없습니다.")
+    secpr_match = re.search(r'(<hp:secPr\b.*?</hp:secPr>)', template_xml, re.S)
+    if not secpr_match:
+        raise ValueError("HWPX section property를 찾을 수 없습니다.")
+    root_open = root_match.group(1)
+    secpr = secpr_match.group(1)
+
+    def para(text: str, idx: int, kind: str = "body") -> str:
+        escaped = escape(text or "", quote=False)
+        if kind == "title":
+            para_pr, char_pr = "23", "41"
+        elif kind == "heading":
+            para_pr, char_pr = "24", "31"
+        else:
+            para_pr, char_pr = "25", "0"
+        return (
+            f'<hp:p id="{idx}" paraPrIDRef="{para_pr}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
+            f'<hp:run charPrIDRef="{char_pr}"><hp:t>{escaped}</hp:t></hp:run></hp:p>'
+        )
+
+    body = [
+        '<hp:p id="0" paraPrIDRef="29" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
+        f'<hp:run charPrIDRef="37">{secpr}</hp:run></hp:p>'
+    ]
+    for idx, line in enumerate(lines, 1):
+        kind = "title" if idx == 1 else ("heading" if line.startswith("□ ") else "body")
+        body.append(para(line, idx, kind))
+    return root_open + "".join(body) + "</hs:sec>"
 
 
 def write_hwpx(data: dict[str, Any], out_path: Path) -> None:
-    """Create a simple HWPX package that contains the consolidated text."""
-    section = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
-{build_hwpx_section(data)}
-</hp:sec>'''
-    header = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
-  <hh:beginNum page="1" footnote="1" endnote="1" pic="1" tbl="1" equation="1"/>
-  <hh:refList/>
-  <hh:fontfaces itemCnt="1"><hh:fontface lang="KO" fontCnt="1"><hh:font id="0" face="맑은 고딕" type="TTF"/></hh:fontface></hh:fontfaces>
-  <hh:styles itemCnt="1"><hh:style id="0" type="PARA" name="바탕글" engName="Normal" paraPrIDRef="0" charPrIDRef="0" nextStyleIDRef="0" langID="1042" lockForm="0"/></hh:styles>
-  <hh:paraProperties itemCnt="1"><hh:paraPr id="0" tabPrIDRef="0" condense="0" fontLineHeight="0" snapToGrid="1" suppressLineNumbers="0" checked="0"/></hh:paraProperties>
-  <hh:charProperties itemCnt="1"><hh:charPr id="0" height="1000" textColor="#000000" shadeColor="none" useFontSpace="0" useKerning="0"><hh:fontRef hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/></hh:charPr></hh:charProperties>
-</hh:head>'''
-    content_hpf = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<opf:package xmlns:opf="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
-  <opf:metadata><opf:title>주간업무계획 회의자료</opf:title><opf:language>ko-KR</opf:language></opf:metadata>
-  <opf:manifest><opf:item id="header" href="header.xml" media-type="application/xml"/><opf:item id="section0" href="section0.xml" media-type="application/xml"/></opf:manifest>
-  <opf:spine><opf:itemref idref="section0"/></opf:spine>
-</opf:package>'''
-    version = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><hv:version xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version" app="한글" major="1" minor="0" micro="0" buildNumber="1"/>'''
-    settings = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><hs:settings xmlns:hs="http://www.hancom.co.kr/hwpml/2011/settings"/>'''
-    container = '''<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/></rootfiles></container>'''
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("mimetype", "application/hwp+zip", compress_type=zipfile.ZIP_STORED)
-        zf.writestr("version.xml", version)
-        zf.writestr("META-INF/container.xml", container)
-        zf.writestr("Contents/content.hpf", content_hpf)
-        zf.writestr("Contents/header.xml", header)
-        zf.writestr("Contents/section0.xml", section)
-        zf.writestr("Settings/settings.xml", settings)
+    """Create an openable HWPX by cloning a sanitized real HWPX skeleton."""
+    if not BASE_HWPX.exists():
+        raise FileNotFoundError("templates/base.hwpx 템플릿이 없습니다. HWPX 기본 골격 파일이 필요합니다.")
+    lines = build_hwpx_lines(data)
+    preview_text = "\r\n".join(f"<{line}>" if line else "" for line in lines)
+    title_text = "주간업무계획 회의자료"
+    with zipfile.ZipFile(BASE_HWPX, "r") as zin, zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data_bytes = zin.read(item.filename)
+            if item.filename == "mimetype":
+                zout.writestr(item, data_bytes, compress_type=zipfile.ZIP_STORED)
+                continue
+            if item.filename == "Contents/section0.xml":
+                xml = data_bytes.decode("utf-8", errors="replace")
+                data_bytes = build_hwpx_section_from_template(xml, lines).encode("utf-8")
+            elif item.filename.startswith("Contents/section") and item.filename.endswith(".xml"):
+                continue
+            elif item.filename == "Preview/PrvText.txt":
+                data_bytes = preview_text.encode("utf-8")
+            elif item.filename == "Contents/content.hpf":
+                text = data_bytes.decode("utf-8", errors="replace")
+                text = re.sub(r"<opf:title>.*?</opf:title>", f"<opf:title>{title_text}</opf:title>", text, flags=re.S)
+                data_bytes = text.encode("utf-8")
+            zout.writestr(item, data_bytes)
+    validate_hwpx(out_path, must_contain=["주간업무계획 회의자료", data.get("week_title", "")])
 
 
 @app.get("/health")
